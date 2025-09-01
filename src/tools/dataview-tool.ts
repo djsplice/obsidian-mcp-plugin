@@ -39,12 +39,13 @@ export class DataviewTool {
       if (format === 'dql') {
         // Execute DQL query
         const result = await dataviewAPI.query(query);
+        const normalized = this.formatQueryResult(result);
         return {
           success: true,
           query,
           format,
-          result: this.formatQueryResult(result),
-          type: result.type || 'unknown',
+          result: normalized,
+          type: normalized?.type || result.type || 'unknown',
           workflow: this.generateQueryWorkflow(query, result),
           hints: this.generateQueryHints(query, result)
         };
@@ -196,39 +197,111 @@ export class DataviewTool {
   private formatQueryResult(result: any): any {
     if (!result) return null;
 
-    // Handle different result types
-    switch (result.type) {
-      case 'list':
+    // Helper to coerce Dataview DataArray or plain arrays into JS arrays
+    const toArray = (v: any): any[] => {
+      if (!v) return [];
+      if (Array.isArray(v)) return v;
+      if (typeof v.array === 'function') return v.array();
+      return [v];
+    };
+
+    // Infer a more accurate type if missing or unexpected
+    const inferType = (r: any): string => {
+      if (r.type) return String(r.type).toLowerCase();
+      const candidate = (r.values ?? r.value ?? r.rows ?? r.tasks ?? r.data);
+      const vals = toArray(candidate);
+      if (r.headers && (r.values || r.rows)) return 'table';
+      if (vals.length) {
+        if (Array.isArray(vals[0])) return 'table';
+        const t0 = vals[0];
+        if (t0 && typeof t0 === 'object') {
+          const isTaskLike = (
+            'task' in t0 ||
+            'checked' in t0 ||
+            'completed' in t0 ||
+            'status' in t0 ||
+            'text' in t0
+          );
+          if (isTaskLike) return 'task';
+          return 'list';
+        }
+        return 'list';
+      }
+      return 'unknown';
+    };
+
+    let type = inferType(result);
+    let valuesSource: any = (result.values ?? result.value ?? result.rows ?? result.tasks ?? result.data);
+
+    // Unwrap a nested container like [{ type: 'task', values: [...] }] or { type, values }
+    const tryUnwrap = (v: any): any | null => {
+      if (Array.isArray(v) && v.length === 1) {
+        const el = v[0];
+        if (el && typeof el === 'object' && (el.type) && (el.values || el.rows || el.tasks || el.data)) {
+          return el;
+        }
+      }
+      if (v && typeof v === 'object' && (v.type) && (v.values || v.rows || v.tasks || v.data)) {
+        return v;
+      }
+      return null;
+    };
+
+    const unwrapped = tryUnwrap(valuesSource);
+    if (unwrapped) {
+      type = inferType(unwrapped);
+      valuesSource = (unwrapped.values ?? unwrapped.rows ?? unwrapped.tasks ?? unwrapped.data);
+    }
+
+    switch (type) {
+      case 'list': {
         return {
           type: 'list',
-          values: result.values?.array() || []
+          values: toArray(valuesSource)
         };
-      case 'table':
+      }
+      case 'table': {
+        const rows = toArray(valuesSource).map((row: any) => {
+          if (Array.isArray(row)) return row;
+          if (row && typeof row.array === 'function') return row.array();
+          // Fallback: convert object row values to array
+          return Object.values(row ?? {});
+        });
         return {
           type: 'table',
-          headers: result.headers || [],
-          values: result.values?.array()?.map((row: any) => row.array()) || []
+          headers: Array.isArray(result.headers) ? result.headers : (result.headers?.array?.() ?? []),
+          values: rows
         };
-      case 'task':
+      }
+      case 'task': {
+        const tasks = toArray(valuesSource).map((task: any) => {
+          const text = task?.text ?? task?.description ?? '';
+          const completed = (
+            task?.completed ??
+            task?.checked ??
+            (typeof task?.status === 'string' && ['x', 'X', 'done', 'completed', 'true'].includes(task.status))
+          ) ? true : false;
+          const line = task?.line ?? task?.position?.start?.line ?? undefined;
+          const path = task?.path ?? task?.file?.path ?? task?.section?.path ?? task?.header?.path ?? undefined;
+          return { text, completed, line, path };
+        });
         return {
           type: 'task',
-          values: result.values?.array()?.map((task: any) => ({
-            text: task.text,
-            completed: task.completed,
-            line: task.line,
-            path: task.path
-          })) || []
+          values: tasks
         };
-      case 'calendar':
+      }
+      case 'calendar': {
         return {
           type: 'calendar',
           values: result.values || {}
         };
-      default:
+      }
+      default: {
         return {
           type: 'unknown',
           data: result
         };
+      }
     }
   }
 
