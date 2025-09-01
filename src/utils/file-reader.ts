@@ -71,7 +71,7 @@ export async function readFileWithFragments(
     const wordCount = fileContent.split(/\s+/).length;
     
     return {
-      content: fileResponse,
+      content: fileContent,
       metadata: {
         ...metadata,
         wordCount,

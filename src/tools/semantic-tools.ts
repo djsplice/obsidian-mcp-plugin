@@ -6,6 +6,104 @@ import { isImageFile as isImageFileObject } from '../types/obsidian';
 import { App } from 'obsidian';
 import { DataviewTool, isDataviewToolAvailable } from './dataview-tool';
 
+// --- Dataview formatting helpers for MCP output ---
+function mdEscape(text: any): string {
+  const s = String(text ?? '');
+  return s.replace(/\|/g, '\\|');
+}
+
+function truncate(str: string, max = 200): string {
+  if (!str) return '';
+  return str.length > max ? str.slice(0, max - 1) + '…' : str;
+}
+
+function toMarkdownForDataview(query: string, payload: any): string {
+  // payload is the object returned by DataviewTool.executeQuery()
+  // shape: { success, query, format, result, type, workflow, hints }
+  if (!payload) return 'No result.';
+  const header = `Dataview • ${payload.type?.toUpperCase?.() || 'RESULT'}`;
+  const meta = `Query: ${'`' + (payload.query || query) + '`'}`;
+  const result = payload.result;
+
+  const MAX_ROWS = 50;
+  const MAX_TEXT = 200;
+
+  let body = '';
+  if (!result) {
+    body = '_Empty result_';
+  } else {
+    switch (result.type) {
+      case 'list': {
+        const items: any[] = Array.isArray(result.values) ? result.values : [];
+        const shown = items.slice(0, MAX_ROWS);
+        const renderItem = (v: any): string => {
+          if (v == null) return '';
+          if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') return String(v);
+          // try meaningful fields
+          const text = v.text ?? v.title ?? v.name ?? v.display;
+          const path = v.path ?? v.file?.path;
+          if (text && path) return `${text} (${path})`;
+          if (text) return String(text);
+          if (path) return String(path);
+          try {
+            return JSON.stringify(v);
+          } catch {
+            return String(v);
+          }
+        };
+        body = shown.map((v) => `- ${truncate(renderItem(v), MAX_TEXT)}`).join('\n');
+        if (items.length > shown.length) body += `\n… and ${items.length - shown.length} more`;
+        break;
+      }
+      case 'table': {
+        const headers: string[] = Array.isArray(result.headers) ? result.headers : [];
+        const rows: any[][] = Array.isArray(result.values) ? result.values : [];
+        const shown = rows.slice(0, MAX_ROWS);
+        if (headers.length) {
+          body += `| ${headers.map(h => mdEscape(h)).join(' | ')} |\n`;
+          body += `| ${headers.map(() => '---').join(' | ')} |\n`;
+          body += shown.map(r => `| ${r.map(c => mdEscape(truncate(String(c), MAX_TEXT))).join(' | ')} |`).join('\n');
+        } else {
+          // Fallback if headers missing
+          body += shown.map(r => `- ${r.map(c => truncate(String(c), MAX_TEXT)).join(' • ')}`).join('\n');
+        }
+        if (rows.length > shown.length) body += `\n… and ${rows.length - shown.length} more rows`;
+        break;
+      }
+      case 'task': {
+        const tasks: any[] = Array.isArray(result.values) ? result.values : [];
+        const shown = tasks.slice(0, MAX_ROWS);
+        body = shown.map(t => `- [${t.completed ? 'x' : ' '}] ${truncate(t.text || '', MAX_TEXT)} (${t.path ?? ''}${typeof t.line === 'number' ? `:${t.line}` : ''})`).join('\n');
+        if (tasks.length > shown.length) body += `\n… and ${tasks.length - shown.length} more tasks`;
+        break;
+      }
+      default: {
+        // unknown or calendar or any other complex structure: keep it concise
+        const candidate: any = (result?.values ?? result?.value ?? result?.rows ?? result?.tasks ?? result);
+        const arr = Array.isArray(candidate)
+          ? candidate
+          : (candidate && typeof candidate.array === 'function')
+            ? candidate.array()
+            : [];
+        const count = Array.isArray(arr) ? arr.length : 0;
+        const sample = arr[0] || (candidate && typeof candidate === 'object' ? candidate : undefined);
+        const sampleKeys = sample && typeof sample === 'object' ? Object.keys(sample).slice(0, 8) : [];
+        body = `Result contains ${count} item(s).` + (sampleKeys.length ? ` Sample keys: ${sampleKeys.join(', ')}.` : '');
+      }
+    }
+  }
+
+  // Optional workflow suggestions
+  let suggestions = '';
+  const suggested = payload.workflow?.suggested_next as any[] | undefined;
+  if (suggested?.length) {
+    const shown = suggested.slice(0, 3);
+    suggestions = ['\n\nSuggested next actions:', ...shown.map(s => `- ${s.description || ''}\n  • ${s.command || ''}`)].join('\n');
+  }
+
+  return `### ${header}\n\n${meta}\n\n${body}${suggestions}`.trim();
+}
+
 /**
  * Unified semantic tools that consolidate all operations into 5 main verbs
  */
@@ -138,15 +236,23 @@ const createSemanticTool = (operation: string) => ({
         };
       }
 
-      return {
-        content: [{
-          type: 'text' as const,
-          text: JSON.stringify({
-            result: result.result,
-            context: result.context
-          }, null, 2)
-        }]
-      };
+      try {
+        const md = toMarkdownForDataview(args.query, result.result);
+        return {
+          content: [{
+            type: 'text' as const,
+            text: md
+          }]
+        };
+      } catch (e) {
+        // Fallback to JSON if formatting fails
+        return {
+          content: [{
+            type: 'text' as const,
+            text: JSON.stringify({ result: result.result, context: result.context }, null, 2)
+          }]
+        };
+      }
     }
 
     const router = new SemanticRouter(api, app);
@@ -186,6 +292,38 @@ const createSemanticTool = (operation: string) => ({
       };
     }
     
+    // Fallback for vault.read where content is not a string (e.g., empty array from fragment flow)
+    if (operation === 'vault' && args.action === 'read' && response.result && typeof (response.result as any).content !== 'string') {
+      try {
+        const fallbackRequest: SemanticRequest = {
+          operation,
+          action: args.action,
+          params: { ...args, returnFullFile: true, includeContent: true }
+        };
+        const fallback = await router.route(fallbackRequest);
+        if (fallback?.result && typeof (fallback.result as any).content === 'string') {
+          return {
+            content: [{
+              type: 'text' as const,
+              text: (fallback.result as any).content
+            }]
+          };
+        }
+      } catch (e) {
+        // proceed to normal formatting below
+      }
+    }
+
+    // For vault.read on text/markdown notes, return the markdown content directly
+    if (operation === 'vault' && args.action === 'read' && response.result && typeof (response.result as any).content === 'string') {
+      return {
+        content: [{
+          type: 'text' as const,
+          text: (response.result as any).content
+        }]
+      };
+    }
+
     // Only filter image files if they contain binary data that would cause JSON errors
     // For search results, we want to show image files in the results list
     const filteredResult = response.result;
@@ -197,6 +335,16 @@ const createSemanticTool = (operation: string) => ({
           type: 'image' as const,
           data: filteredResult.base64Data,
           mimeType: filteredResult.mimeType
+        }]
+      };
+    }
+
+    // For view.file on text/markdown notes, return the markdown content directly
+    if (operation === 'view' && args.action === 'file' && filteredResult && typeof filteredResult.content === 'string') {
+      return {
+        content: [{
+          type: 'text' as const,
+          text: filteredResult.content
         }]
       };
     }
