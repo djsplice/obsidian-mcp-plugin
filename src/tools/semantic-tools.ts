@@ -5,16 +5,109 @@ import { isImageFile } from '../utils/image-handler';
 import { isImageFile as isImageFileObject } from '../types/obsidian';
 import { App } from 'obsidian';
 import { DataviewTool, isDataviewToolAvailable } from './dataview-tool';
+import { mdEscape, truncate, DEFAULT_LIMITS } from './format';
 
-// --- Dataview formatting helpers for MCP output ---
-function mdEscape(text: any): string {
-  const s = String(text ?? '');
-  return s.replace(/\|/g, '\\|');
+// --- Generic formatting helpers for MCP output ---
+function toMarkdownForOperation(operation: string, action: string, response: any): string {
+  if (!response) return 'No result.';
+  
+  // Handle different operation types
+  switch (operation) {
+    case 'vault':
+      return formatVaultResponse(action, response);
+    case 'graph':
+      return formatGraphResponse(action, response);
+    case 'search':
+      return formatSearchResponse(response);
+    default:
+      return formatGenericResponse(response);
+  }
 }
 
-function truncate(str: string, max = 200): string {
-  if (!str) return '';
-  return str.length > max ? str.slice(0, max - 1) + '…' : str;
+function formatVaultResponse(action: string, response: any): string {
+  const result = response.result || response;
+  
+  switch (action) {
+    case 'list': {
+      const files = Array.isArray(result) ? result : [];
+      const header = `### Files (${files.length})`;
+      const items = files.slice(0, DEFAULT_LIMITS.maxRows).map((f: string) => `- ${f}`);
+      const truncated = files.length > DEFAULT_LIMITS.maxRows ? `\n… and ${files.length - DEFAULT_LIMITS.maxRows} more` : '';
+      return `${header}\n\n${items.join('\n')}${truncated}`;
+    }
+    case 'search': {
+      const searchResult = result.results || result;
+      if (!Array.isArray(searchResult)) return 'No search results.';
+      
+      const header = `### Search Results (${result.totalResults || searchResult.length})`;
+      const items = searchResult.slice(0, DEFAULT_LIMITS.maxRows).map((r: any) => 
+        `- **${r.title || r.path}** ${r.score ? `(${r.score})` : ''}\n  \`${r.path}\``
+      );
+      const truncated = searchResult.length > DEFAULT_LIMITS.maxRows ? `\n… and ${searchResult.length - DEFAULT_LIMITS.maxRows} more` : '';
+      return `${header}\n\n${items.join('\n')}${truncated}`;
+    }
+    case 'fragments': {
+      const fragments = Array.isArray(result) ? result : [];
+      if (fragments.length === 0) return 'No relevant fragments found.';
+      
+      const header = `### Fragments (${fragments.length})`;
+      const items = fragments.slice(0, DEFAULT_LIMITS.maxRows).map((f: any, i: number) => {
+        const lines = f.lineStart && f.lineEnd ? ` (lines ${f.lineStart}-${f.lineEnd})` : '';
+        const score = f.score ? ` - Score: ${Math.round(f.score * 100)}%` : '';
+        const content = f.content ? `\n\n${f.content}` : '';
+        return `#### Fragment ${i + 1}${lines}${score}${content}`;
+      });
+      const truncated = fragments.length > DEFAULT_LIMITS.maxRows ? `\n\n… and ${fragments.length - DEFAULT_LIMITS.maxRows} more fragments` : '';
+      return `${header}\n\n${items.join('\n\n')}${truncated}`;
+    }
+    default:
+      return formatGenericResponse(response);
+  }
+}
+
+function formatGraphResponse(action: string, response: any): string {
+  const result = response.result || response;
+  
+  switch (action) {
+    case 'neighbors':
+    case 'traverse': {
+      const nodes = result.nodes || [];
+      const edges = result.edges || [];
+      const header = `### Graph ${action === 'neighbors' ? 'Neighbors' : 'Traversal'} (${nodes.length} nodes, ${edges.length} connections)`;
+      
+      const nodeItems = nodes.slice(0, DEFAULT_LIMITS.maxRows).map((n: any) => 
+        `- **${n.title || n.path}** (${n.links?.total || 0} links)\n  \`${n.path}\``
+      );
+      const truncated = nodes.length > DEFAULT_LIMITS.maxRows ? `\n… and ${nodes.length - DEFAULT_LIMITS.maxRows} more nodes` : '';
+      
+      return `${header}\n\n${nodeItems.join('\n')}${truncated}`;
+    }
+    case 'statistics': {
+      const stats = result.statistics || result;
+      return `### Graph Statistics\n\n- **Total files**: ${stats.totalFiles || 0}\n- **Total links**: ${stats.totalLinks || 0}\n- **Orphaned files**: ${stats.orphanedFiles || 0}\n- **Most connected**: ${stats.mostConnected?.title || 'None'} (${stats.mostConnected?.connections || 0} links)`;
+    }
+    default:
+      return formatGenericResponse(response);
+  }
+}
+
+function formatSearchResponse(response: any): string {
+  // Fallback for generic search formatting
+  return formatVaultResponse('search', response);
+}
+
+function formatGenericResponse(response: any): string {
+  const result = response.result || response;
+  if (typeof result === 'string') return result;
+  if (Array.isArray(result)) {
+    const items = result.slice(0, DEFAULT_LIMITS.maxRows).map((item: any) => `- ${String(item)}`);
+    const truncated = result.length > DEFAULT_LIMITS.maxRows ? `\n… and ${result.length - DEFAULT_LIMITS.maxRows} more` : '';
+    return `### Results (${result.length})\n\n${items.join('\n')}${truncated}`;
+  }
+  
+  // For objects, try to extract meaningful content
+  const keys = Object.keys(result).slice(0, 5);
+  return `### Result\n\n${keys.map(k => `- **${k}**: ${String(result[k])}`).join('\n')}`;
 }
 
 function toMarkdownForDataview(query: string, payload: any): string {
@@ -25,8 +118,8 @@ function toMarkdownForDataview(query: string, payload: any): string {
   const meta = `Query: ${'`' + (payload.query || query) + '`'}`;
   const result = payload.result;
 
-  const MAX_ROWS = 50;
-  const MAX_TEXT = 200;
+  const MAX_ROWS = DEFAULT_LIMITS.maxRows;
+  const MAX_TEXT = DEFAULT_LIMITS.maxText;
 
   let body = '';
   if (!result) {
@@ -56,18 +149,71 @@ function toMarkdownForDataview(query: string, payload: any): string {
         break;
       }
       case 'table': {
-        const headers: string[] = Array.isArray(result.headers) ? result.headers : [];
-        const rows: any[][] = Array.isArray(result.values) ? result.values : [];
-        const shown = rows.slice(0, MAX_ROWS);
+        const headersRaw: any[] = Array.isArray(result.headers) ? result.headers : [];
+        const headers: string[] = headersRaw.map(h => String(h));
+        const rowsRaw: any = Array.isArray(result.values) ? result.values : (result?.value ?? result?.rows ?? []);
+
+        const toArray = (x: any): any[] => Array.isArray(x)
+          ? x
+          : (x && typeof x.array === 'function')
+            ? x.array()
+            : [];
+
+        const getByPath = (obj: any, path: string) => {
+          if (!obj) return undefined;
+          const parts = String(path).split('.');
+          let cur = obj;
+          for (const p of parts) {
+            if (cur == null) return undefined;
+            cur = cur[p];
+          }
+          return cur;
+        };
+
+        const rowToArray = (r: any): any[] => {
+          if (Array.isArray(r)) return r;
+          if (r && typeof r.array === 'function') return r.array();
+          if (r?.values) return toArray(r.values);
+          if (r?.row) return toArray(r.row);
+          if (r?.cells) return toArray(r.cells);
+          if (!headers.length) return [];
+          // Resolve header paths against object
+          return headers.map((h) => {
+            // Special-case File header
+            if (h.toLowerCase() === 'file') {
+              const name = r?.file?.name ?? r?.name ?? r?.fileName ?? r?.basename;
+              const path = r?.file?.path ?? r?.path;
+              return name && path ? `[[${path}|${name}]]` : (name ?? path ?? '');
+            }
+            const v = getByPath(r, h);
+            return v;
+          });
+        };
+
+        const printable = (v: any): string => {
+          if (v == null) return '';
+          if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') return String(v);
+          if (v?.path && (v?.display || v?.name)) {
+            const disp = v.display ?? v.name;
+            return `[[${v.path}|${disp}]]`;
+          }
+          if (v?.toISOString && typeof v.toISOString === 'function') {
+            try { return v.toISOString(); } catch {}
+          }
+          try { return JSON.stringify(v); } catch { return String(v); }
+        };
+
+        const rowsArr: any[][] = toArray(rowsRaw).map(rowToArray);
+        const shown = rowsArr.slice(0, MAX_ROWS);
+
         if (headers.length) {
           body += `| ${headers.map(h => mdEscape(h)).join(' | ')} |\n`;
           body += `| ${headers.map(() => '---').join(' | ')} |\n`;
-          body += shown.map(r => `| ${r.map(c => mdEscape(truncate(String(c), MAX_TEXT))).join(' | ')} |`).join('\n');
+          body += shown.map(r => `| ${r.map(c => mdEscape(truncate(printable(c), MAX_TEXT))).join(' | ')} |`).join('\n');
         } else {
-          // Fallback if headers missing
-          body += shown.map(r => `- ${r.map(c => truncate(String(c), MAX_TEXT)).join(' • ')}`).join('\n');
+          body += shown.map(r => `- ${r.map(c => truncate(printable(c), MAX_TEXT)).join(' • ')}`).join('\n');
         }
-        if (rows.length > shown.length) body += `\n… and ${rows.length - shown.length} more rows`;
+        if (rowsArr.length > shown.length) body += `\n… and ${rowsArr.length - shown.length} more rows`;
         break;
       }
       case 'task': {
@@ -237,7 +383,9 @@ const createSemanticTool = (operation: string) => ({
       }
 
       try {
-        const md = toMarkdownForDataview(args.query, result.result);
+        const resp = result.result as any;
+        const mdFromEnvelope: string | undefined = resp?.markdown;
+        const md = mdFromEnvelope || toMarkdownForDataview(args.query, resp);
         return {
           content: [{
             type: 'text' as const,
@@ -350,24 +498,27 @@ const createSemanticTool = (operation: string) => ({
     }
     
     try {
+      // Use direct markdown formatting instead of JSON wrapper
+      const markdown = toMarkdownForOperation(operation, args.action, {
+        result: filteredResult,
+        workflow: response.workflow,
+        context: response.context,
+        efficiency_hints: response.efficiency_hints
+      });
+      
       return {
         content: [{
           type: 'text' as const,
-          text: JSON.stringify({
-            result: filteredResult,
-            workflow: response.workflow,
-            context: response.context,
-            efficiency_hints: response.efficiency_hints
-          }, null, 2)
+          text: markdown
         }]
       };
     } catch (error) {
-      // Handle JSON serialization errors
-      console.error('JSON serialization failed:', error);
+      // Handle formatting errors
+      console.error('Response formatting failed:', error);
       return {
         content: [{
           type: 'text' as const,
-          text: `Error: Unable to serialize response. ${error instanceof Error ? error.message : 'Unknown error'}`
+          text: `Error: Unable to format response. ${error instanceof Error ? error.message : 'Unknown error'}`
         }]
       };
     }

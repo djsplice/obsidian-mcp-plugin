@@ -1,6 +1,7 @@
 import { ObsidianAPI } from './obsidian-api';
 import { isImageFile } from '../types/obsidian';
 import { UniversalFragmentRetriever } from '../indexing/fragment-retriever';
+import { DEFAULT_LIMITS, mdEscape, toMarkdownTable, truncate } from '../tools/format';
 
 interface FileReadOptions {
   path: string;
@@ -43,7 +44,15 @@ export async function readFileWithFragments(
   
   // Check if it's an image file
   if (isImageFile(fileResponse)) {
-    return fileResponse as FileReadResult;
+    // For images, preserve legacy return but add a tiny meta hint
+    const resp = fileResponse as FileReadResult;
+    return {
+      ...resp,
+      metadata: {
+        ...(resp?.metadata || {}),
+        previewType: 'image'
+      }
+    };
   }
   
   // Extract content from the response
@@ -69,15 +78,35 @@ export async function readFileWithFragments(
   // Return full file if requested
   if (returnFullFile) {
     const wordCount = fileContent.split(/\s+/).length;
-    
+
+    // Build markdown preview (truncated for safety)
+    let mdPreview = '```markdown\n' + fileContent + '\n```';
+    let truncated = false;
+    const bytes = new TextEncoder().encode(mdPreview).length;
+    if (bytes > DEFAULT_LIMITS.maxMarkdownBytes) {
+      // Approximate truncation
+      const approxCharLimit = DEFAULT_LIMITS.maxMarkdownBytes - 512;
+      const sliced = fileContent.slice(0, approxCharLimit);
+      mdPreview = '```markdown\n' + sliced + '\n\n… (truncated)\n```';
+      truncated = true;
+    }
+
     return {
       content: fileContent,
       metadata: {
         ...metadata,
         wordCount,
-        warning: wordCount > 2000 ? 
-          `This file contains ${wordCount} words. Consider using fragment retrieval (remove returnFullFile parameter) to reduce context consumption.` : 
-          null
+        warning: wordCount > 2000 ?
+          `This file contains ${wordCount} words. Consider using fragment retrieval (remove returnFullFile parameter) to reduce context consumption.` :
+          null,
+        // New standardized meta additions (non-breaking)
+        markdown: mdPreview,
+        meta: {
+          type: 'file',
+          source: path,
+          count: wordCount,
+          truncated
+        }
       }
     };
   }
@@ -93,7 +122,20 @@ export async function readFileWithFragments(
     maxFragments: maxFragments || 5
   });
   
-  // Return structured response with fragments
+  // Build a markdown table preview for fragments
+  const rows = (fragmentResponse.result || []).map((f) => ({
+    path: f.docPath,
+    lines: `${f.lineStart}-${f.lineEnd}`,
+    score: Math.round((f.score ?? 0) * 100) / 100,
+    preview: truncate(f.content, DEFAULT_LIMITS.maxText)
+  }));
+  const markdown = toMarkdownTable(rows, {
+    maxRows: DEFAULT_LIMITS.maxRows,
+    maxCols: DEFAULT_LIMITS.maxCols,
+    maxText: DEFAULT_LIMITS.maxText
+  });
+
+  // Return structured response with fragments + standardized preview/meta fields (non-breaking additions)
   return {
     ...metadata,
     content: fragmentResponse.result,
@@ -104,6 +146,16 @@ export async function readFileWithFragments(
       query: fragmentQuery
     },
     workflow: fragmentResponse.workflow,
-    efficiency_hints: fragmentResponse.efficiency_hints
+    efficiency_hints: fragmentResponse.efficiency_hints,
+    // New additions
+    markdown,
+    meta: {
+      type: 'fragments',
+      source: path,
+      count: fragmentResponse.result.length,
+      strategy: strategy || 'auto',
+      query: fragmentQuery,
+      truncated: rows.length > DEFAULT_LIMITS.maxRows
+    }
   };
 }
